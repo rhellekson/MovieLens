@@ -1,0 +1,324 @@
+---
+title: "MovieLens Project"
+author: "Reid Hellekson"
+date: "12/13/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.pos = '!h')
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+if(!require(broom)) install.packages("broom", repos = "http://cran.us.r-project.org")
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+```
+
+```{r rmse_fun, echo= FALSE, message = FALSE}
+RMSE <- function(actual, predicted){
+  sqrt(mean((actual - predicted)^2))
+}
+
+```
+
+## Introduction
+
+This is a submission for the MovieLens project performed by Reid Hellekson. The goal of this project was to demonstrate techniques learned in Professor Rafael Irizarry's edx Data Science Program by creating a movie recommendation system using the 10M record version of the MovieLens dataset (https://grouplens.org/datasets/movielens/10m/).  Ultimately, we look to create a recommendation system that has a root mean squared error of less than 0.8649.
+
+The provided dataset contains movie ratings by users that also includes a timestamp and a concatenated field of all applicable genres.  In the below, details on data wrangling and manipulation are presented.  Then we delve into exploration, visualization, and insights.  Also, the modeling approach and ultimately the results are presented.
+
+
+
+## Analysis
+
+In this project, a lot of the data extraction and transformation is performed by the provided script.  By implementing this script, the MovieLens dataset is downloaded and the two files are unzipped - "movies" and "ratings".  Delimiters are removed, column names added, and data types are forced on both files.  Then, the two files are combined so we have "ratings" and "genres" in one nearly tidy dataset.  The data wrangling process is completed by creating a clean test and validation set for the analysis.  The resulting dataset looks like this:
+
+```{r download, echo= FALSE, message = FALSE, warning = FALSE}
+
+  # Note: this process could take a couple of minutes
+  
+  # MovieLens 10M dataset:
+  # https://grouplens.org/datasets/movielens/10m/
+  # http://files.grouplens.org/datasets/movielens/ml-10m.zip
+  
+  dl <- tempfile()
+  download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+  
+  ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                   col.names = c("userId", "movieId", "rating", "timestamp"))
+  
+  movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+  colnames(movies) <- c("movieId", "title", "genres")
+  movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                             title = as.character(title),
+                                             genres = as.character(genres))
+  
+  movielens <- left_join(ratings, movies, by = "movieId")
+  
+  # Validation set will be 10% of MovieLens data
+  
+  set.seed(1)
+  test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+  edx <- movielens[-test_index,]
+  temp <- movielens[test_index,]
+  
+  # Make sure userId and movieId in validation set are also in edx set
+  
+  validation <- temp %>% 
+    semi_join(edx, by = "movieId") %>%
+    semi_join(edx, by = "userId")
+  
+  # Add rows removed from validation set back into edx set
+  
+  removed <- anti_join(temp, validation)
+  edx <- rbind(edx, removed)
+  
+  rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+
+#Present a clean table of the first few rows
+kable(head(edx), row.names = FALSE, booktabs = TRUE) %>% 
+  kable_styling(latex_options = c('scale_down'), position = 'center')
+```
+
+It is worth noting that this data is not necessarily tidy.  There is a release year concatenated into the title column and the genres column is a pipe delimited combination of all applicable genres.  However, the data is sizable and we will forgo the added overhead of extra tidying at this point.
+
+#### Exploration
+To begin, let's take a quick look at the data and how it is distributed.
+
+```{r explore1, echo= FALSE, message = FALSE, fig.height = 3, align = 'c'}
+avg_rating <-  mean(edx$rating)
+
+edx %>% ggplot(aes(rating)) +
+  geom_histogram(bins = 30, color = 'black') +
+  scale_y_continuous(breaks = c(1e6,2e6,3e6), labels = c(1,2,3)) +
+  labs(title = 'MovieLens Rating Distribution') + xlab('Rating') + ylab('Frequency (M)')
+
+tibble(`Number of Movies` = length(unique(edx$movieId)), 
+  `Number of Users` = length(unique(edx$userId)),
+  `Number of Genres` = length(unique(edx$genres)),
+  `Average Rating` = round(avg_rating,2)) %>% 
+  kable(booktabs = TRUE) %>% 
+  kable_styling(position = 'center')
+
+bind_rows(
+    edx %>% group_by(movieId) %>% 
+    summarize(N = n()) %>% 
+    pull(N) %>% summary(N) %>% 
+    tidy(),
+    edx %>% group_by(userId) %>% 
+    summarize(N = n()) %>% 
+    pull(N) %>% summary(N) %>% 
+    tidy()) %>% 
+  data.frame() %>% 
+  `rownames<-` (c('Ratings per Movie','Ratings per User')) %>% 
+  kable(booktabs = TRUE, row.names = TRUE) %>% 
+  kable_styling(position = 'center')
+
+```
+
+#### Mean Model
+Visually, there is an apparent clustering around the mean (i.e. between a rating of 3 and 4).  Let's begin with a model based on a constant assumption of the sample mean and get a sense of our error terms.  In other words, we look at:
+$$Y_{u,i} = \mu + \epsilon_{u,i}$$ 
+
+```{r meanModel, echo= FALSE, message = FALSE}
+edx <- edx %>% mutate(mu = avg_rating)
+mean_model <- RMSE(edx$rating, edx$mu)
+results <- data.frame(Method = 'Mean Model', RMSE = mean_model)
+```
+And get RMSE = `r mean_model`.
+
+Where root mean squared error (RMSE) is defined by:
+$$RMSE = \sqrt{\frac{1}{N} * \sum_{u,i}(\hat{y}_{u,i} - y_{u,i})^2}$$
+
+#### Movie Effect
+Let's see if we can improve this by including a consideration for a movie effect or bias.  In other words, some movies may be rated differently than others, so let's model:
+$$Y_{u,i} = \mu + b_i + \epsilon_{u,i}$$ 
+where 
+$$b_i = Y_{u,i} - \mu$$
+
+```{r movieEffect, echo = FALSE, warning = FALSE, message = FALSE}
+b_i <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(bi = mean(rating - avg_rating))
+
+edx <- edx %>% 
+  left_join(b_i, by = 'movieId')
+
+movie_effect <- edx %>% summarize(RMSE(rating, mu + bi)) %>% as.numeric()
+results <- rbind(results,data.frame(Method = 'Movie Effect Model', RMSE = movie_effect))
+```
+
+By including this movie bias, we get RMSE = `r movie_effect`.  An improvement!
+
+#### User Effect
+Next, let's examine whether there is any explanatory information in the user itself.  First, let's see if users are on average different.  Here is a distribution of users' average rating for users that have rated more than 100 movies.
+
+```{r userEffect, echo = FALSE, message = FALSE, fig.height = 3}
+
+edx %>% 
+  group_by(userId) %>% 
+  summarize(bu = mean(rating)) %>% 
+  filter(n() > 100) %>% 
+  ggplot(aes(bu)) + 
+  geom_histogram(bins = 30, color = 'black') +
+  labs(title = 'MovieLens User Rating Distribution', subtitle = 'Users with > 100 ratings') + xlab('Rating') + 
+  theme(axis.title.y = element_blank())
+
+b_u <- edx %>% 
+  group_by(userId) %>% 
+  summarize(bu = mean(rating - avg_rating - bi))
+
+edx <- edx %>%
+  left_join(b_u, by = 'userId')
+
+user_effect <- edx %>% summarize(RMSE(rating, avg_rating + bi + bu)) %>% as.numeric()
+results <- rbind(results, data.frame(Method = 'Movie and User Effect Model', RMSE = user_effect))
+
+```
+
+We see that there is variation across users, so let's now try a model like:
+$$Y_{u,i} = \mu + b_i + b_u + \epsilon_{u,i}$$ 
+where $b_u$ is the effect of the user giving the rating.
+
+By including this user bias, we get RMSE = `r user_effect`.  More improvement!
+
+#### Genre Effect
+As noted earlier, the MovieLens data includes a genres variable.  With more resources, one might be tempted to split this out into a more tidy framework.  However, the concatenated field can be treated as a variable itself.  The concatenation appears to be consistent, so let's examine the inclusion of a genres bias.
+
+```{r genresEffect, echo = FALSE, message = FALSE, fig.height = 3}
+
+edx %>% 
+  group_by(genres) %>% 
+  summarize(bu = mean(rating)) %>% 
+  filter(n() > 100) %>% 
+  ggplot(aes(bu)) + 
+  geom_histogram(bins = 30, color = 'black') +
+  labs(title = 'MovieLens Genres Rating Distribution', subtitle = 'Genres with > 100 ratings') + xlab('Rating') + 
+  theme(axis.title.y = element_blank())
+
+b_g <- edx %>% 
+  group_by(genres) %>% 
+  summarize(bg = mean(rating - avg_rating - bi - bu))
+
+edx <- edx %>% 
+  left_join(b_g,by = 'genres')
+
+genres_effect <- edx %>% summarize(RMSE(rating,avg_rating + bi + bu + bg)) %>% as.numeric()
+results <- rbind(results, data.frame(Method = 'Movie, User, and Genres Effect Model', RMSE = genres_effect))
+```
+
+There is notable variation here as well.  If we add this into the model as we've done with the previous biases, we get:
+$$Y_{u,i} = \mu + b_i + b_u + b_g + \epsilon_{u,i}$$ 
+where $b_g$ is the effect of the genre.
+
+After this decomposition, we have a new RMSE of: `r genres_effect`.  More improvement still!
+
+#### Regularization
+Ok, now what about overfitting? Early in our exploration of the data, we noticed that there were users who hadn't rated many movies and numerous movies that hadn't had many ratings.  Could our biases be too strong in some cases? Let's look at our best and worst predicted movies (i.e. movies where our movie bias model was most wrong).
+
+```{r overfitting, echo = FALSE}
+edx %>% left_join(edx %>% count(movieId) %>% data.frame(), by = 'movieId') %>% 
+  mutate(predicted = avg_rating + bi, error = rating - predicted) %>% 
+  arrange(desc(abs(error))) %>% 
+  select(title, error, predicted, rating, `#Ratings` = n) %>% 
+  distinct() %>% 
+  slice(1:10) %>% 
+  kable(booktabs = TRUE) %>% 
+  kable_styling(position = 'center')
+```
+
+There are some well known movies here that had some potentially biased user ratings.  However, there are also a number of obscure movies in the above.  These movies have relatively few ratings.  It appears that there is evidence of overfitting.  In each of our biases, we can constrain the total variability of the effect of sizes by employing regularization.
+
+```{r regularization, echo = FALSE}
+
+lambdas <- seq(-0.5,5,0.25)
+
+rmses <- sapply(lambdas, function(l){
+
+  b_ir <- edx %>%
+    group_by(movieId) %>%
+    summarize(bir = sum(rating - mu) / (n() + l))
+
+  b_ur <- edx %>%
+    left_join(b_ir, by = 'movieId') %>%
+    group_by(userId) %>%
+    summarize(bur = sum(rating - bir - mu) / (n() + l))
+  
+  b_gr <- edx %>%
+    left_join(b_ir, by = 'movieId') %>%
+    left_join(b_ur, by = 'userId') %>% 
+    group_by(genres) %>%
+    summarize(bgr = sum(rating - mu - bir - bur) / (n() + l))
+  
+  predicted_ratings <- edx %>% 
+    left_join(b_ir, by = 'movieId') %>%
+    left_join(b_ur, by = 'userId') %>%
+    left_join(b_gr, by = 'genres') %>% 
+    mutate(pred = mu + bir + bur + bgr) %>% 
+    pull(pred)
+  
+  return(RMSE(predicted_ratings,edx$rating))
+  
+})
+
+
+results <- rbind(results,
+                     data.frame(Method = 'Regularization Movie, User, Genres Model', RMSE = min(rmses)))
+
+
+lambda <- lambdas[which.min(rmses)]
+
+```
+
+With this form of regularization, there is a tuning parameter, $\lambda$.  If we plot, possible values for $\lambda$ against the resulting error term in our test set, we get the following:
+
+```{r tuning, echo = FALSE, fig.width = 5, fig.height = 3, fig.align = 'center'}
+qplot(lambdas,rmses)
+```
+
+From this plot we see that the RMSE is minimized at `r lambdas[which.min(rmses)]`.  This value of $\lambda$ results in an error of `r min(rmses)`.  This is a pretty good result.  We have further converged our error metric.  And, in the next section, we will see how all of these models compare and if we have met our threshold on the validation set as well.
+
+## Results
+
+This MovieLens dataset is large, so we began with a basic model.  As we explored the data, we found ways to increase the complexity without adding too much overhead.  To recap our results:
+
+`r results %>% kable(booktabs = TRUE) %>% kable_styling(position = 'center')`
+
+So far we have only looked at our training set.
+
+```{r validation, echo = FALSE, cache = FALSE}
+
+b_ir <- edx %>%
+  group_by(movieId) %>%
+  summarize(bir = sum(rating - mu) / (n() + lambda))
+
+b_ur <- edx %>%
+  left_join(b_ir, by = 'movieId') %>%
+  group_by(userId) %>%
+  summarize(bur = sum(rating - bir - mu) / (n() + lambda))
+
+b_gr <- edx %>%
+  left_join(b_ir, by = 'movieId') %>%
+  left_join(b_ur, by = 'userId') %>% 
+  group_by(genres) %>%
+  summarize(bgr = sum(rating - mu - bir - bur) / (n() + lambda))
+
+validation <- validation %>% 
+  left_join(b_ir, by = 'movieId') %>%
+  left_join(b_ur, by = 'userId') %>%
+  left_join(b_gr, by = 'genres') %>% 
+  mutate(pred = avg_rating + bir + bur + bgr) 
+  
+validated_error <- RMSE(validation$pred,validation$rating)
+```
+
+When we run the finalized model against the validation set, we get an error of: `r validated_error`.  Bingo! We have an error under our benchmark.
+
+## Conclusion
+
+We began with the 10M record MovieLens dataset that was downloaded via Professor Irizarry's script.  We cleaned the data, explored the data, and applied the techniques from the "Recommendation Systems" curriculum.  Some constraints in the way of memory and processor speed were noticeable and limited our ability to readily apply a multitude of models.  Future work could involve employing boosting/bagging techniques and more sophisticated models like neural networks.
+
+
